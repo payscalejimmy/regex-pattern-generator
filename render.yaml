@@ -1,0 +1,6 @@
+services:
+     - type: web
+       name: regex-pattern-generator
+       env: python
+       buildCommand: pip install -r requirements.txt
+       startCommand: gunicorn --bind 0.0.0.0:$PORT flask_pattern_generator:app
