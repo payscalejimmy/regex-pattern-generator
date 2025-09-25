@@ -1,5 +1,6 @@
 from flask import Flask, request, render_template_string, jsonify
-import pandas as pd
+import csv
+import io
 import os
 from werkzeug.utils import secure_filename
 import re
@@ -209,7 +210,7 @@ HTML_TEMPLATE = '''
                     </div>
                 </div>
 
-                <h3>📝 Generated Code for Cell 2:</h3>
+                <h3>📄 Generated Code for Cell 2:</h3>
                 <p>Copy the code below and paste it into Cell 2 of your Colab notebook to replace the REGEX_PATTERNS dictionary:</p>
                 
                 <div class="code-output">
@@ -266,73 +267,88 @@ def generate_default_color(index):
     return colors[index % len(colors)]
 
 def process_csv_to_patterns(csv_file):
-    """Convert CSV file to REGEX_PATTERNS OrderedDict format"""
+    """Convert CSV file to REGEX_PATTERNS OrderedDict format using built-in csv module"""
     try:
-        # Read CSV
-        df = pd.read_csv(csv_file)
+        # Read the CSV file content as text
+        content = csv_file.read().decode('utf-8')
         
-        # Normalize column names (lowercase, strip spaces, replace common variations)
-        df.columns = df.columns.str.lower().str.strip()
+        # Parse CSV using built-in csv module
+        csv_reader = csv.DictReader(io.StringIO(content))
+        rows = list(csv_reader)
+        
+        if not rows:
+            raise ValueError("No data rows found in CSV file")
+        
+        # Normalize column names (lowercase, strip spaces)
+        normalized_rows = []
+        for row in rows:
+            normalized_row = {}
+            for key, value in row.items():
+                if key:  # Skip None keys
+                    normalized_key = key.lower().strip()
+                    normalized_row[normalized_key] = value
+            normalized_rows.append(normalized_row)
         
         # Map common column name variations
         column_mapping = {
             'name': 'pattern_name',
             'regex': 'pattern',
             'regex_pattern': 'pattern',
-            'pattern_regex': 'pattern',  # Handle your specific CSV format
+            'pattern_regex': 'pattern',
             'desc': 'description',
-            'description': 'description',
             'colour': 'color',
             'hex_color': 'color',
-            'priority': 'priority',
-            'priority_level': 'priority',  # Handle your specific CSV format
-            'processing_order': 'priority',  # Alternative mapping
+            'priority_level': 'priority',
+            'processing_order': 'priority',
             'order': 'priority'
         }
         
-        # Apply column mapping
-        for old_col, new_col in column_mapping.items():
-            if old_col in df.columns and new_col not in df.columns:
-                df[new_col] = df[old_col]
+        # Apply column mapping and fill defaults
+        processed_rows = []
+        for i, row in enumerate(normalized_rows):
+            # Apply column mapping
+            mapped_row = {}
+            for original_key, mapped_key in column_mapping.items():
+                if original_key in row and mapped_key not in row:
+                    mapped_row[mapped_key] = row[original_key]
+            
+            # Merge mapped columns back
+            for key, value in row.items():
+                mapped_row[key] = value
+            
+            # Check required columns
+            if 'pattern_name' not in mapped_row or 'pattern' not in mapped_row:
+                continue  # Skip rows missing required fields
+            
+            if not mapped_row.get('pattern_name') or not mapped_row.get('pattern'):
+                continue  # Skip empty required fields
+            
+            # Fill missing values
+            if 'description' not in mapped_row or not mapped_row.get('description'):
+                mapped_row['description'] = mapped_row['pattern_name']
+            
+            if 'priority' not in mapped_row or not mapped_row.get('priority'):
+                mapped_row['priority'] = '1'
+            else:
+                try:
+                    mapped_row['priority'] = str(int(float(mapped_row['priority'])))
+                except (ValueError, TypeError):
+                    mapped_row['priority'] = '1'
+            
+            if 'color' not in mapped_row or not mapped_row.get('color'):
+                mapped_row['color'] = generate_default_color(i)
+            else:
+                color = mapped_row['color']
+                if not str(color).startswith('#'):
+                    mapped_row['color'] = f'#{color}'
+            
+            processed_rows.append(mapped_row)
         
-        # Check required columns
-        required_columns = ['pattern_name', 'pattern']
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        if not processed_rows:
+            raise ValueError("No valid rows found in CSV file. Check that pattern_name and pattern columns exist and are not empty.")
         
-        if missing_columns:
-            raise ValueError(f"Missing required columns: {missing_columns}. Found columns: {list(df.columns)}")
-        
-        # Remove empty rows
-        df = df.dropna(subset=['pattern_name', 'pattern'])
-        
-        if len(df) == 0:
-            raise ValueError("No valid rows found in CSV file")
-        
-        # Fill missing values
-        if 'description' not in df.columns:
-            df['description'] = df['pattern_name']
-        else:
-            df['description'] = df['description'].fillna(df['pattern_name'])
-        
-        if 'priority' not in df.columns:
-            df['priority'] = 1
-        else:
-            df['priority'] = pd.to_numeric(df['priority'], errors='coerce').fillna(1)
-        
-        # Generate colors if missing
-        if 'color' not in df.columns:
-            df['color'] = [generate_default_color(i) for i in range(len(df))]
-        else:
-            df['color'] = df['color'].fillna('#87CEEB')
-            # Ensure colors have # prefix
-            df['color'] = df['color'].apply(lambda x: x if str(x).startswith('#') else f'#{x}')
-        
-        # Clean pattern names
-        df['pattern_name'] = df['pattern_name'].apply(clean_pattern_name)
-        
-        # Sort by priority if specified, otherwise maintain CSV order
-        if 'priority' in df.columns:
-            df = df.sort_values(['priority', 'pattern_name'])
+        # Sort by priority if specified
+        processed_rows.sort(key=lambda x: (int(x.get('priority', 1)), x.get('pattern_name', '')))
         
         # Generate the Python code
         code_lines = [
@@ -342,8 +358,8 @@ def process_csv_to_patterns(csv_file):
             "REGEX_PATTERNS = OrderedDict(["
         ]
         
-        for idx, row in df.iterrows():
-            pattern_name = row['pattern_name']
+        for row in processed_rows:
+            pattern_name = clean_pattern_name(row['pattern_name'])
             pattern = escape_regex_for_string(str(row['pattern']))
             description = str(row['description']).replace("'", "\\'")
             color = row['color']
@@ -365,13 +381,13 @@ def process_csv_to_patterns(csv_file):
         generated_code = "\n".join(code_lines)
         
         # Calculate statistics
-        priorities = len(df['priority'].unique())
+        priorities = len(set(row['priority'] for row in processed_rows))
         
         return {
             'success': True,
             'code': generated_code,
-            'pattern_count': len(df),
-            'csv_rows': len(df),
+            'pattern_count': len(processed_rows),
+            'csv_rows': len(processed_rows),
             'priorities': priorities
         }
         
